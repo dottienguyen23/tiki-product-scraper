@@ -1,22 +1,19 @@
-# Project 02 – Runbook: the full process, start to finish
+# Runbook: running the Tiki scraper
 
-🌐 **English** | [Tiếng Việt](RUNBOOK.vi.md)
+Every command needed to run `src/scraper.py`, from an empty folder to a checked result. The *why* behind each design choice is in the [Guide](GUIDE.md); the results are in the [README](../README.md).
 
-Every command needed to run this project from an empty folder to a published result, in order. The *why* behind each step is in [GUIDE.md](GUIDE.md); the results are in [README.md](README.md).
-
-All commands run in WSL from the project folder:
+All commands run in WSL from the project root. **Every new terminal or `tmux` window** needs the virtual environment activated first; without it, `python` is "command not found":
 ```bash
-cd /mnt/c/Users/Admin/Desktop/Project_02
-source .venv/bin/activate
+cd /mnt/c/Users/Admin/Desktop/data-engineering/02-tiki-product-scraper
+source .venv/bin/activate        # the prompt now starts with (.venv)
 ```
 
 ## Golden rules
 
-1. **Only one job talks to Tiki at a time.** The scraper, the retry and the probes share one IP address, so Tiki adds their traffic together.
+1. **Only one job talks to Tiki at a time.** Every run from this machine shares one IP address, and Tiki adds their traffic together.
 2. **Never restart Windows or let it sleep during a run.** That stops WSL, `tmux` and the scraper. Set *Settings → System → Power* → sleep **Never**. Fix Wi-Fi by toggling Airplane mode, not by restarting.
-3. **Always keep a log on disk:** `python -u <script> 2>&1 | tee -a logs/<name>.log`.
-4. **Never change `BATCH_SIZE` between runs**, and keep `LIMIT` a multiple of `BATCH_SIZE`. The checkpoint depends on batch numbers.
-5. **After a block, rest before the next request-heavy step.** Check with the `curl` command in step 2 until it returns JSON, then wait 5 more minutes.
+3. **Never change `BATCH_SIZE`**, and keep `--limit` a multiple of 1,000. The checkpoint depends on batch numbers.
+4. **Stay below Tiki's limit.** Measured: 1.17 req/s is safe, 1.43 req/s gets blocked. Never use `--interval` below `0.85` or more than one worker.
 
 ---
 
@@ -26,16 +23,16 @@ source .venv/bin/activate
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-mkdir -p data output errors logs
+mkdir -p data
 ```
-Put the ID list from the course at `data/ids.csv` (one ID per line, header `id`). Check it:
+Put the ID list at `data/ids.csv` (one ID per line, header `id`). Check it:
 ```bash
 head -3 data/ids.csv
 wc -l data/ids.csv          # about 200,001 lines (IDs + header)
 ```
-`.gitignore` must contain: `.venv/`, `data/`, `output/`, `errors/`, `logs/`, `output_retry/`, `errors_retry/`, `final_errors.csv`, `retry_ids.csv`, `*.tmp`.
+`.gitignore` must contain: `.venv/`, `data/`, `output/`, `errors/`, `logs/`, `retry/`, `*.tmp`.
 
-## 2. Look at the API
+## 2. Check the API
 
 ```bash
 curl -s -o /dev/null --max-time 10 -w "%{http_code} %{content_type}\n" -A "Mozilla/5.0" \
@@ -43,80 +40,60 @@ curl -s -o /dev/null --max-time 10 -w "%{http_code} %{content_type}\n" -A "Mozil
 ```
 | Output | Meaning |
 |---|---|
-| `200 application/json; charset=utf-8` | ✅ API works, not blocked |
-| `200 text/html` / `429` / `403` | ❌ blocked: wait (see the loop below) |
-| `000` | no connection: your network |
+| `200 application/json; charset=utf-8` | API works, not blocked |
+| `200 text/html` / `429` / `403` | blocked: wait and check again in a few minutes |
+| `000` | no connection: check your network |
 
-Wait automatically until a block ends (checks every 2 minutes):
+The scraper runs the same check itself (pre-flight) and stops with exit code `1` if it fails.
+
+## 3. Options
+
 ```bash
-while true; do
-  r=$(curl -s -o /dev/null --max-time 10 -w "%{http_code} %{content_type}" -A "Mozilla/5.0" \
-      https://api.tiki.vn/product-detail/api/v1/products/1391347)
-  echo "$(date +%H:%M:%S)  $r"
-  case "$r" in *json*) echo "✅ Not blocked any more"; break ;; esac
-  sleep 120
-done
+python src/scraper.py --help
 ```
-Then try one product in Python:
-```bash
-python steps/step1_one_product.py
-python steps/step2_clean_description.py
-```
+| Option | Default | Meaning |
+|---|---|---|
+| `--ids` | `data/ids.csv` | input ID list |
+| `--root` | project root | where `output/`, `errors/` and `logs/` are created |
+| `--limit` | none (all IDs) | test on the first N IDs (multiple of 1,000) |
+| `--interval` | `1.0` | seconds between request starts. `0.85` is the fastest measured safe value |
+| `--workers` | `1` | parallel requests. Keep at 1: the rate limit is what matters |
+| `--timeout` | `10` | seconds to wait for one response |
+| `--max-network-errors` | `20` | network errors in a row that mean "connection down" |
+| `--check-every` / `--max-wait` | `120` / `3600` | while blocked or offline: check every 2 min, give up after 1 h |
+| `--verbose` | off | also log debug details |
 
-## 3. Find the safe speed
-
-One request at a time: `python probe_rate.py <interval> <requests> [first ID position]`.
-`<interval>` is the time between the **starts** of two requests, so `1.0` means exactly 1 request per second, whatever Tiki's response time. Before measuring, the script checks that the API answers JSON (no leftover block); it stops at the first block page, `403`, `429` or 5 network errors in a row.
-```bash
-python probe_rate.py 1.0 300 20000     # measured: 1.00 req/s, no block (Tiki answers in ~0.42 s)
-# rest at least 5 minutes before the next one
-python probe_rate.py 0.85 300 30000    # measured: 1.17 req/s, no block
-```
-Use a different ID position each time, so every test asks for different products.
-
-Measured with the first version of `probe_rate.py`, which paused **after** each answer: ~0.7 req/s safe; ~1.9 req/s blocked after 11 requests.
-Parallel workers, the way `scraper.py` sends requests:
-```bash
-python -u steps/probe_workers.py 2>&1 | tee -a logs/probe_workers.log
-# measured: 1 worker 0.64 req/s ok; 2 workers 1.43 req/s blocked
-```
-**Result:** Tiki accepts at least **1.17 req/s** and blocks at **1.43 req/s** → **1 worker, one request every 0.85 s** (~1.18 req/s, about 18% below the blocked rate). 200,000 IDs then take about **47 h (~2 days)**.
-
-| Pacing | Rate | 200k IDs | Result |
+| `--interval` | Rate | One batch | 200,000 IDs |
 |---|---|---|---|
-| 1 s pause after each answer (first run) | ~0.7 req/s | ~74 h | ✅ |
-| one request every 1.0 s | 1.00 req/s | ~56 h | ✅ |
-| **one request every 0.85 s** | **1.17 req/s** | **~47 h** | ✅ **use this** |
-| 2 workers | 1.43 req/s | — | ❌ blocked after ~38 requests |
-| one request every ~0.2 s | ~1.9 req/s | — | ❌ blocked after 11 requests |
+| `1.0` (default) | 1.00 req/s | ~17 min | ~56 h |
+| `0.85` | 1.17 req/s | ~14 min | ~47 h |
 
 ## 4. Test run
 
-In `scraper_simple.py` set `LIMIT = 3000` (a multiple of 1000), then:
 ```bash
-python -u scraper_simple.py 2>&1 | tee -a logs/run.log
-python steps/step8_check_results.py
+python -u src/scraper.py --limit 3000
+echo $?                     # 0 = finished and reconciled
 ```
-Check: 3 files in `output/`, about 23 minutes per batch, errors mostly `HTTP 404`.
-Then set `LIMIT = None` for the full run. Batches 1–3 are kept and skipped.
+Check: 3 files in `output/`, errors mostly `HTTP 404`, and the last log lines say `-> OK`. These batches are kept: the full run skips them.
 
-## 5. Full run (several days)
+## 5. Full run (2–3 days)
 
 ```bash
 tmux new -s tiki
 source .venv/bin/activate
-python -u scraper_simple.py 2>&1 | tee -a logs/run.log
+python -u src/scraper.py --interval 0.85
 # Ctrl-b then d  -> detach; the scraper keeps running
 ```
-`python -u NguyenThiKimTuyen_LV1_project_02.py` does the same: it is the submission file and runs `scraper_simple.py`.
+The log is written to `logs/run.log` automatically, so `tee` is not needed.
 
-The first run paused 1 s after each answer (~0.7 req/s, ~23 min per batch). To use the faster measured pacing, change the pause in `scraper_simple.py` the same way as in `steps/step9_retry_failed.py` (`INTERVAL = 0.85`: sleep only what is left of the interval). A batch then takes about 14 minutes.
 | Command | Purpose |
 |---|---|
 | `tmux ls` | list sessions |
-| `tmux attach -t tiki` | watch the progress (leave with `Ctrl-b` then `d`, **never** `Ctrl-c`) |
+| `tmux attach -t tiki` | watch progress (leave with `Ctrl-b` then `d`; `Ctrl-c` stops the scraper) |
 | `pgrep -af scraper` | is the process alive? |
-| `kill <PID>` | stop politely; the checkpoint lets it resume later |
+| `kill <PID>` | stop politely; finished batches are kept |
+
+To resume after any stop, run the same command again: finished batches are skipped.
 
 ## 6. Monitor (at least twice a day)
 
@@ -125,65 +102,47 @@ tail -5 logs/run.log                                     # last batches
 ls -lt output/ | head -3                                 # newest batch and when it was saved
 cut -d, -f2 "$(ls -t errors/*.csv | head -1)" | sort | uniq -c | sort -rn   # errors of the newest batch
 ```
-| Red flag | Likely cause | Action |
+| Log message or sign | Meaning | Action |
 |---|---|---|
-| A batch takes about **3 hours** instead of ~23 min | every request times out (11 s each): Wi-Fi or network down | Check Wi-Fi (`curl` command in step 2). Fix without restarting |
-| Newest batch: nearly all `ConnectionError` / `ReadTimeout` / `ConnectTimeout` | same | same; those IDs go to the retry in step 8 |
-| `Bị chặn` messages keep repeating | Tiki is blocking | leave it: the scraper waits and retries the same ID |
-| No new file for more than 1 hour, process alive | stuck, or Windows slept | `tmux attach -t tiki` and look |
-| `pgrep` shows nothing | the scraper stopped | start step 5 again: finished batches are skipped |
+| `Batch NNNN halted (blocked)` | Tiki is blocking | Nothing: the scraper waits, then redoes the batch |
+| `Batch NNNN halted (network down)` | 20 network errors in a row | Check Wi-Fi (step 2). Fix it without restarting |
+| `API unavailable for over 60 min. Stopping.` | the wait ran out | Fix the cause, then rerun the step 5 command |
+| No new batch for more than 1 hour, process alive | stuck, or Windows slept | `tmux attach -t tiki` and look |
+| `pgrep` shows nothing | the scraper stopped | rerun the step 5 command |
 
 ## 7. Check the result
 
-```bash
-python steps/step8_check_results.py      # completeness: ok + errors = IDs? errors by reason; writes retry_ids.csv
-python steps/step8b_profile_products.py  # quality: empty fields, prices, descriptions, unusual batches
-python steps/step8c_runtime.py           # runtime: time per batch, pauses, time lost
+At the end of a full run the scraper reconciles the output itself and logs, for example:
 ```
-
-## 8. Retry the temporary errors
-
-`retry_ids.csv` holds every failed ID except `HTTP 404` (products that no longer exist are never retried).
-```bash
-wc -l retry_ids.csv
-tmux new -s retry
-source .venv/bin/activate
-python -u steps/step9_retry_failed.py 2>&1 | tee -a logs/retry.log
-# Ctrl-b then d
+Validation: 200/200 batches | products=... errors=... | duplicates=0
+Validation: products + errors = 200000 | input IDs = 200000 -> OK
 ```
-It writes to `output_retry/` and `errors_retry/` (the first pass is not touched), starts one request every **0.85 s** (about 2.8 h for ~12,000 IDs), uses a 5 s timeout, and has a **circuit breaker**: after 20 network errors in a row it stops, waits until Tiki answers, and redoes those IDs. If it stops with `Stopped: no answer for 60 min`, run the same command again later; finished retry batches are skipped.
+| Exit code | Meaning |
+|---|---|
+| `0` | finished, and products + errors = input IDs |
+| `1` | stopped early: pre-flight failed, or blocked/offline for too long |
+| `2` | finished, but the reconciliation failed: read the `Missing batches` line |
+| `130` | stopped with `Ctrl-c` |
+
+## 8. Retry the temporary errors (optional)
+
+`HTTP 404` means the product no longer exists, so it is never retried. Everything else (`ConnectionError`, `ReadTimeout`, `HTTP 5xx`...) can succeed on a second pass. Build the retry list, then run the same scraper into a separate folder so the first pass is never touched:
 ```bash
-tail -3 logs/retry.log      # "Done / Xong!" = finished
+mkdir -p retry
+( echo id; awk -F, 'FNR > 1 && $2 != "HTTP 404" {print $1}' errors/errors_*.csv ) > retry/ids.csv
+wc -l retry/ids.csv
+python -u src/scraper.py --ids retry/ids.csv --root retry --interval 0.85
 ```
+Results:
+- products from both passes: `output/` + `retry/output/`
+- final failed IDs: the `HTTP 404` rows in `errors/` + everything in `retry/errors/`
 
-## 9. Final report
+## 9. Commit and publish
 
 ```bash
-python steps/step10_final_report.py
-```
-It combines both passes, checks **products + errors = input IDs**, and writes `final_errors.csv` (id, final reason). That file is the DoD's list of failed products with the reason. Copy its numbers into the **Results** table of the README.
-
-## 10. Commit and publish
-
-In `Project_02`:
-```bash
-git status                 # nothing from data/, output*/, errors*/, logs/
-git add .gitignore README.md README.vi.md RUNBOOK.md RUNBOOK.vi.md GUIDE.md GUIDE.vi.md steps/ *.py requirements.txt
+cd /mnt/c/Users/Admin/Desktop/data-engineering/02-tiki-product-scraper
+git status                 # nothing from data/, output/, errors/, logs/, retry/
+git add -A
 git commit -m "<what changed>"
-```
-In the journey repo:
-```bash
-cd /mnt/c/Users/Admin/Desktop/data-engineering-journey
-git update-index --refresh
-git subtree pull --prefix=project_02 /mnt/c/Users/Admin/Desktop/Project_02 main -m "Update project_02 from Project_02"
 git push
 ```
-Check `https://github.com/dottienguyen23/data-engineering-journey/tree/main/project_02`.
-
-## 11. Submit
-
-- [ ] README results table filled in from step 9
-- [ ] `final_errors.csv` exists (committed, or its summary in the README)
-- [ ] Repo pushed and checked on GitHub
-- [ ] Repo link submitted through the course's Google Form
-- [ ] Daily Task Report written ("taki taki")
