@@ -29,7 +29,7 @@ The published code is the final production version, [`src/scraper.py`](../src/sc
 | 7 | Operations: `tmux`, logs | Is the result complete and correct? |
 | 8 | Check the result | Want it more robust and automatic |
 | 9 | Hardening (v4) | Settings live in the code; a dead network still produces thousands of errors |
-| 10 | Production → `src/scraper.py` (v5) | — |
+| 10 | Production → `src/scraper.py` (v4.1) | — |
 
 ---
 
@@ -350,7 +350,7 @@ def get_product_wait_if_blocked(session, product_id):
 <summary>✅ Solution</summary>
 
 ```bash
-cd /mnt/c/Users/Admin/Desktop/Project_02
+cd /mnt/c/Users/Admin/Desktop/data-engineering/02-tiki-product-scraper
 tmux new -s tiki                          # named session that survives closing the window
 source .venv/bin/activate
 python -u src/scraper.py
@@ -407,7 +407,7 @@ The script:
 
 `csv.DictReader` reads by column name, so it works even when error files have 2 columns (simple version) or 3 columns (v4 and later).
 
-In v5 this check is built in: it runs at the end of every full run and sets the exit code.
+In v4.1 this check is built in (step `[4]`): it runs at the end of every full run and sets the exit code.
 
 </details>
 
@@ -421,7 +421,7 @@ What v4 adds on top of the simple version, and why:
 
 | Addition | Why |
 |---|---|
-| `BASE_DIR = Path(__file__).resolve().parent` | Paths work from any working directory (in v5 `.parent.parent`, because the script moved into `src/`) |
+| `BASE_DIR = Path(__file__).resolve().parent` | Paths work from any working directory (in v4.1 `.parent.parent`, because the script moved into `src/`) |
 | `load_ids()` reports invalid and duplicate counts | Bad input is visible instead of silently dropped |
 | `explore_one()` test call before the run | Stop early if the API is down or blocked |
 | `Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, ...])` | Temporary errors are retried automatically, with growing waits |
@@ -442,48 +442,68 @@ grep "bị chặn" logs/run.log
 
 ---
 
-## Level 10 – Production → `src/scraper.py` (v5)
+## Level 10 – Production → `src/scraper.py` (v4.1)
 
-🎯 **Goal:** one script that anyone can run safely without editing code, and that tells a scheduler whether the run succeeded.
+🎯 **Goal:** one script that anyone can run safely without editing code, and that tells the terminal (or a scheduler) whether the run succeeded.
 
 ⚠️ **Problem:** v4 still had development habits:
 - Settings were edited inside the code. `LIMIT = 3000` was left in, so a "full run" would only fetch 3,000 IDs.
 - A dead network still turned every ID into `ConnectionError` (the 40-hour Wi-Fi outage).
-- The pacing slept 1 s **after** each answer, wasting Tiki's ~0.4 s response time.
+- The pacing slept 1 s **before** each request, so the real gap was 1 s + Tiki's answer time (~1.4 s per ID).
+- No network at startup crashed the pre-flight call with a traceback.
+- `validate()` read every file in `output/`, so leftover files from other runs could make it pass wrongly.
 - It always exited with code 0, even when it stopped early.
 
 🤔 **Think first:** if this script ran every night from a scheduler, with nobody watching the screen, how would the scheduler know whether the run worked?
+
+💡 **Hint:** keep the v4 structure and fix only what is broken. Small changes, no new framework.
 
 <details>
 <summary>✅ Solution: <code>src/scraper.py</code></summary>
 
 | Change | Why |
 |---|---|
-| `argparse` options: `--limit`, `--interval`, `--workers`, `--ids`, `--root`... | Safe defaults (full run); no code edits; `--help` documents itself |
-| `RateLimiter`: one request start every `--interval` seconds, shared by all threads | Exact rate. Default 1.0 s = 1 req/s, about 30% faster than "1 s after each answer" at the same safety |
-| Circuit breaker: 20 network errors in a row halt the batch | A Wi-Fi outage becomes a wait-and-redo, not thousands of `ConnectionError` rows |
-| `validate()` checks only this ID list's batches and reports missing ones | Leftover files from other runs can't fake a pass |
-| Exit codes `0` / `1` / `2` / `130` | A scheduler or script can tell success from failure |
+| `LIMIT` from the command line: `python -u src/scraper.py 3000`; no number = full run | Nobody has to edit the code before running it |
+| `wait_turn()`: one request **start** every `INTERVAL` seconds, shared by all threads | Exact rate. 1.0 s = 1 req/s, about 30% faster than v4 at the same safety |
+| Circuit breaker: 20 network errors in a row set `STOP` ("network down") | A Wi-Fi outage becomes a wait-and-redo, not thousands of `ConnectionError` rows |
+| `try` around the pre-flight request | A clear message instead of a traceback |
+| `validate()` reads only this run's batch numbers and reports missing ones | Leftover files can't fake a pass |
+| `main()` returns an exit code: `0` / `1` / `2` / `130` | The terminal or a scheduler can tell success from failure |
+| `Ctrl-c` sets `STOP` before exiting | Otherwise the thread pool still sends every queued request of the batch |
 | Full date in every log line | A run lasts days; `17:03` alone is ambiguous |
-| Pre-flight handles "no connection" cleanly | A clear message instead of a traceback |
+| `benchmark()` removed | Only needed during development; its results are in the README |
 
+The pacing, as simple as possible:
 ```python
-class RateLimiter:
-    def wait(self):
-        with self._lock:
-            now = time.monotonic()
-            start = max(now, self._next)
-            self._next = start + self.interval
-        time.sleep(start - now)
+def wait_turn():
+    global _next_start
+    with _pace_lock:                       # threads take turns
+        now = time.monotonic()
+        start = max(now, _next_start)      # my turn: now, or later if the last request was too recent
+        _next_start = start + INTERVAL     # the next request may start INTERVAL seconds after mine
+    time.sleep(start - now)                # sleep only the time that is left
 ```
 
-The file names, batch size and checkpoint did **not** change, so v5 resumes from v4's output: the first v5 test logged `skipped 1 finished batches` and `products + errors = 1000 | input IDs = 1000 -> OK`.
+The circuit breaker, inside `fetch_product()`:
+```python
+except requests.RequestException as e:
+    with _count_lock:
+        network_errors_in_a_row += 1
+        if network_errors_in_a_row >= MAX_NETWORK_ERRORS:
+            stop("network down")
+    return pid, None, type(e).__name__, str(e)[:100]
+```
+Any answer from the server resets the counter to 0, so only errors **in a row** count.
+
+The file names, batch size and checkpoint did **not** change, so v4.1 resumes from v4's output.
 
 </details>
 
 **Answer:** the **exit code**. `echo $?` prints it after a run; schedulers, `cron` and CI systems all read it.
 
-📌 **Lesson:** "production-ready" means the script is safe to run by someone who didn't write it: configuration from the outside, failures that stop loudly, and a result that can be checked automatically.
+**Gotcha:** the circuit breaker is not instant. `Retry(total=3)` retries each failed request first, so 20 dead IDs in a row take about 15 minutes. Still far better than 40 hours.
+
+📌 **Lesson:** "production-ready" means the script is safe to run by someone who didn't write it: no code edits to start it, failures that stop loudly, and a result that can be checked automatically. It does **not** mean more code: v4.1 is v4 plus small, targeted fixes.
 
 ---
 
