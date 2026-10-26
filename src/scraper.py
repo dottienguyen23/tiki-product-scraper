@@ -308,7 +308,13 @@ def run_batches(ids, probe_id):
             while True:
                 STOP.clear()
                 network_errors_in_a_row = 0
-                results = list(ex.map(fetch_product, batch))
+                try:
+                    results = list(ex.map(fetch_product, batch))
+                except KeyboardInterrupt:
+                    # Ctrl-c: without this, the pool would still send every queued request
+                    # of the batch before exiting. STOP makes them return at once.
+                    stop("interrupted")
+                    raise
                 if not STOP.is_set():
                     break                             # the whole batch ran without a stop
                 # Stopped in the middle: results are incomplete, so DON'T save.
@@ -391,7 +397,11 @@ def main():
         return 1
 
     start = time.time()
-    finished = run_batches(ids, probe_id=ids[0])     # ids[0] just returned JSON in step [2]
+    try:
+        finished = run_batches(ids, probe_id=ids[0])     # ids[0] just returned JSON in step [2]
+    except KeyboardInterrupt:
+        logger.warning("Stopped with Ctrl-c. Finished batches are saved: run again to continue.")
+        return 130
     logger.info("Total time: %.1f min", (time.time() - start) / 60)
     if not finished:
         return 1
@@ -401,6 +411,7 @@ def main():
 
 if __name__ == "__main__":
     # The exit code tells the terminal (or a scheduler) how the run ended:
-    # 0 = done and reconciled, 1 = stopped early, 2 = done but numbers don't match.
+    # 0 = done and reconciled, 1 = stopped early, 2 = done but numbers don't match,
+    # 130 = stopped with Ctrl-c.
     # Check it after a run with: echo $?
     sys.exit(main())
